@@ -1,13 +1,13 @@
-import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import { FileState, GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
-// One inline attempt plus one same-model Files API retry.
-export const maxDuration = 45;
+// Let the same Gemma model finish a slower defect analysis or Files API retry.
+export const maxDuration = 120;
 
 const MODEL = "gemma-4-26b-a4b-it";
-const PRIMARY_TIMEOUT_MS = 15_000;
-const FALLBACK_TIMEOUT_MS = 18_000;
+const PRIMARY_TIMEOUT_MS = 30_000;
+const FALLBACK_TIMEOUT_MS = 75_000;
 
 const prompt = `You are a textile fabric quality inspector. Inspect the image for visible oil/dirt stains, color bleed, torn weave, missing threads, or uneven dyeing. Be conservative and report only visible defects. Do not provide reasoning. Return only this JSON: {"fabric_quality":"PASS","overall_score":90,"summary":"One short sentence.","defects":[{"id":"def-1","type":"Torn Weave","severity":"CRITICAL","location_description":"Center of sample","confidence":0.95,"recommendation":"Reject damaged section."}]}. fabric_quality must be exactly PASS, WARNING, or FAIL. Score is an integer 0-100. Confidence is 0-1. Report at most 3 defects, most severe first. Keep summary, location, and recommendation brief. Use defects:[] when no defects are visible. PASS means no meaningful defect; WARNING means minor; FAIL means significant damage.`;
 
@@ -21,12 +21,26 @@ function validateResult(value: unknown) {
   result.fabric_quality = quality;
   if (typeof result.overall_score !== "number" || result.overall_score < 0 || result.overall_score > 100) throw new Error("Model response has an invalid overall_score.");
   if (typeof result.summary !== "string" || !Array.isArray(result.defects)) throw new Error("Model response is missing summary or defects.");
-  for (const item of result.defects) {
+  for (const [index, item] of result.defects.entries()) {
     if (!item || typeof item !== "object") throw new Error("Model response contains an invalid defect.");
     const defect = item as Record<string, unknown>;
-    const severity = typeof defect.severity === "string" ? defect.severity.trim().toUpperCase() : "";
-    if (typeof defect.id !== "string" || typeof defect.type !== "string" || !["CRITICAL", "MEDIUM", "LOW"].includes(severity) || typeof defect.location_description !== "string" || typeof defect.recommendation !== "string" || typeof defect.confidence !== "number" || defect.confidence < 0 || defect.confidence > 1) throw new Error("Model response contains an incomplete defect.");
+    const rawSeverity = String(defect.severity ?? "").trim().toUpperCase();
+    const severityAliases: Record<string, string> = { HIGH: "CRITICAL", SEVERE: "CRITICAL", MODERATE: "MEDIUM", MINOR: "LOW" };
+    const severity = ["CRITICAL", "MEDIUM", "LOW"].includes(rawSeverity)
+      ? rawSeverity
+      : severityAliases[rawSeverity] || (quality === "FAIL" ? "CRITICAL" : "MEDIUM");
+    const rawConfidence = defect.confidence ?? defect.confidence_score;
+    const parsedConfidence = typeof rawConfidence === "number" ? rawConfidence : Number(rawConfidence);
+    const confidence = Number.isFinite(parsedConfidence) && parsedConfidence >= 0 && parsedConfidence <= 1 ? parsedConfidence : 0.5;
+    const type = defect.type ?? defect.defect_type ?? defect.name;
+    const location = defect.location_description ?? defect.location;
+    const recommendation = defect.recommendation ?? defect.remediation ?? defect.action;
+    defect.id = typeof defect.id === "string" && defect.id.trim() ? defect.id : `def-${index + 1}`;
+    defect.type = typeof type === "string" && type.trim() ? type.trim() : "Visible fabric defect";
     defect.severity = severity;
+    defect.location_description = typeof location === "string" && location.trim() ? location.trim() : "Location not specified";
+    defect.recommendation = typeof recommendation === "string" && recommendation.trim() ? recommendation.trim() : "Review and isolate the affected section.";
+    defect.confidence = confidence;
   }
   return result;
 }
@@ -63,6 +77,23 @@ async function runModel(ai: GoogleGenAI, mimeType: string, data: string, timeout
             config: { mimeType, displayName: displayName.slice(0, 100) || "fabric-sample", abortSignal: AbortSignal.timeout(5_000) },
           });
           if (!uploaded.uri) throw new Error("Gemma image upload did not return a file URI.");
+          // Files can be returned while Google is still processing them. They
+          // must be ACTIVE before GenerateContent can consume the URI.
+          const readyBy = Date.now() + 5_000;
+          while (uploaded.state !== FileState.ACTIVE && Date.now() < readyBy) {
+            if (uploaded.state === FileState.FAILED) {
+              throw new Error(`Gemma image upload failed: ${uploaded.error?.message || "unknown file processing error"}`);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            if (!uploaded.name) break;
+            uploaded = await ai.files.get({
+              name: uploaded.name,
+              config: { httpOptions: { timeout: 2_000, retryOptions: { attempts: 1 } } },
+            });
+          }
+          if (uploaded.state !== FileState.ACTIVE) {
+            throw new Error(`Gemma image upload was not ready for inference (state: ${uploaded.state || "unknown"}).`);
+          }
           return { fileData: { fileUri: uploaded.uri, mimeType } };
         })();
     const response = await ai.models.generateContent({
