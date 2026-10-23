@@ -8,7 +8,7 @@ Upload, capture, or select a fabric image to receive a structured quality assess
 
 ## Model and license
 
-This project calls **Gemma 4 26B A4B IT** (`gemma-4-26b-a4b-it`) through the Gemini API. Gemma 4 is released under the [Apache 2.0 license](https://ai.google.dev/gemma/apache_2) according to the [official Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4). The model is provided as a hosted API here; this repository does not bundle model weights. Gemini API use requires a Google AI Studio API key and is subject to Google's API terms.
+This project uses **Gemma 4 26B A4B IT** (`gemma-4-26b-a4b-it`) for every inspection through the Gemini API. If inline image input fails or times out, the app retries the same Gemma model through Google's Files API. Gemma 4 is released under the [Apache 2.0 license](https://ai.google.dev/gemma/apache_2) according to the [official Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4). The model is accessed as a hosted API; this repository does not bundle model weights. Gemini API use requires a Google AI Studio API key and is subject to Google's API terms.
 
 ## Getting started
 
