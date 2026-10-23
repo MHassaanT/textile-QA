@@ -18,7 +18,7 @@ const severityClasses: Record<string, string> = { CRITICAL: "severity-critical",
 async function normalizeImageForInspection(file: File) {
   if (typeof createImageBitmap !== "function") return file;
   const bitmap = await createImageBitmap(file);
-  const scale = Math.min(1, 1280 / Math.max(bitmap.width, bitmap.height));
+  const scale = Math.min(1, 1024 / Math.max(bitmap.width, bitmap.height));
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(bitmap.width * scale));
   canvas.height = Math.max(1, Math.round(bitmap.height * scale));
@@ -30,7 +30,7 @@ async function normalizeImageForInspection(file: File) {
   context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   bitmap.close();
   const blob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Could not encode the image for inspection.")), "image/jpeg", 0.92);
+    canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Could not encode the image for inspection.")), "image/jpeg", 0.85);
   });
   const name = `${file.name.replace(/\.[^.]+$/, "") || "fabric-sample"}.jpg`;
   return new File([blob], name, { type: "image/jpeg", lastModified: file.lastModified });
@@ -93,9 +93,12 @@ export default function Home() {
     try {
       const preparedImage = await normalizeImageForInspection(file);
       const form = new FormData(); form.append("image", preparedImage);
-      const response = await fetch("/api/inspect", { method: "POST", body: form });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Inspection could not be completed.");
+      const response = await fetch("/api/inspect", { method: "POST", body: form, signal: AbortSignal.timeout(65_000) });
+      // Vercel returns plain text/HTML (not JSON) on platform timeouts, so don't assume JSON.
+      const raw = await response.text();
+      let payload: any = null;
+      try { payload = JSON.parse(raw); } catch {}
+      if (!response.ok || !payload) throw new Error(payload?.error || (response.status === 504 ? "The inspection timed out. Please retry." : "Inspection could not be completed. Please retry."));
       setResult(payload);
       const entry: AuditEntry = { id: crypto.randomUUID(), timestamp: new Date().toISOString(), fabric_quality: payload.fabric_quality, defects: payload.defects.length, imageName: file.name };
       const next = [entry, ...history].slice(0, 8); setHistory(next); localStorage.setItem("zarea-audits", JSON.stringify(next));
