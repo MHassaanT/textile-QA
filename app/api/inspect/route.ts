@@ -51,48 +51,24 @@ export async function POST(request: Request) {
     if (!apiKey) return NextResponse.json({ error: "GEMINI_API_KEY is not configured. Add it to .env.local to inspect uploaded images." }, { status: 500 });
     const bytes = Buffer.from(await file.arrayBuffer());
     const base64Data = bytes.toString("base64");
-    const ai = new GoogleGenAI({ apiKey });
-    let response;
-    let inlineError: unknown;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        response = await ai.models.generateContent({
-          model: "gemma-4-26b-a4b-it",
-          contents: [{ inlineData: { mimeType: file.type, data: base64Data } }, prompt],
-          config: { responseMimeType: "application/json" },
-        });
-        break;
-      } catch (error) {
-        // Google occasionally returns a transient 500 after a long vision request.
-        // Make one automatic retry for server overloads without repeating other failures.
-        if (!isRetryableUpstreamError(error)) throw error;
-        inlineError = error;
-        if (attempt >= 1) break;
-        await new Promise((resolve) => setTimeout(resolve, 900));
-      }
-    }
-    if (!response && inlineError) {
-      // Fall back to the Gemini Files API. Some valid images intermittently fail
-      // when sent inline, even though the model supports the same image via URI.
-      const uploaded = await ai.files.upload({
-        file: new Blob([bytes], { type: file.type }),
-        config: { mimeType: file.type, displayName: file.name.slice(0, 100) || "fabric-sample" },
+    // Let Gemma finish its response without imposing an application timeout.
+    // Disable the SDK's multi-attempt retry policy to avoid retry storms; Vercel
+    // remains the outer bound for a request that never completes.
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { retryOptions: { attempts: 1 } },
+    });
+    let response: Awaited<ReturnType<typeof ai.models.generateContent>>;
+    try {
+      response = await ai.models.generateContent({
+        model: "gemma-4-26b-a4b-it",
+        contents: [{ inlineData: { mimeType: file.type, data: base64Data } }, prompt],
+        config: { responseMimeType: "application/json" },
       });
-      try {
-        if (!uploaded.uri) throw new Error("Google uploaded the image but did not return a file URI.");
-        response = await ai.models.generateContent({
-          model: "gemma-4-26b-a4b-it",
-          contents: [{ fileData: { fileUri: uploaded.uri, mimeType: file.type } }, prompt],
-          config: { responseMimeType: "application/json" },
-        });
-      } finally {
-        if (uploaded.name) {
-          try { await ai.files.delete({ name: uploaded.name }); }
-          catch (cleanupError) { console.warn("Could not remove temporary Gemini upload:", cleanupError instanceof Error ? cleanupError.message : cleanupError); }
-        }
-      }
+    } catch (error) {
+      if (!isRetryableUpstreamError(error)) throw error;
+      return NextResponse.json({ error: upstreamErrorMessage(error) }, { status: 502 });
     }
-    if (!response) throw inlineError ?? new Error("The model returned no response.");
     if (!response.text) throw new Error("The model returned an empty response.");
     return NextResponse.json(validateResult(JSON.parse(response.text)));
   } catch (error) {
