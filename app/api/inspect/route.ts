@@ -2,26 +2,58 @@ import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
-// Bound the primary and same-model transport fallback within Vercel's limit.
+// Hard ceiling for the whole request. Primary + fallback attempts below are budgeted to fit inside it.
 export const maxDuration = 60;
 
-const PRIMARY_MODEL = "gemma-4-26b-a4b-it";
-// Retry with the same Gemma model through the Files API if inline input errors or times out.
-const PRIMARY_TIMEOUT_MS = Number(process.env.INSPECT_PRIMARY_TIMEOUT_MS) || 15_000;
+const PRIMARY_MODEL = process.env.INSPECT_MODEL || "gemma-4-26b-a4b-it";
+// Second attempt when the first errors (5xx/429) or is too slow. Defaults to Gemma again (project requires Gemma 4).
+const FALLBACK_MODEL = process.env.INSPECT_FALLBACK_MODEL || PRIMARY_MODEL;
+const PRIMARY_TIMEOUT_MS = Number(process.env.INSPECT_PRIMARY_TIMEOUT_MS) || 22_000;
 const FALLBACK_TIMEOUT_MS = 25_000;
 
 const prompt = `Act as an expert Textile Quality Assurance Inspection AI. Analyze the provided fabric image for visible anomalies or defects such as oil spots, color bleeds, torn weave, missing warp threads, dirt stains, or uneven dyeing. Be conservative: do not invent defects that are not visible. Return only valid JSON, no markdown, no extra text, matching exactly this structure: {"fabric_quality":"PASS"|"WARNING"|"FAIL","overall_score":85,"summary":"One short sentence overview.","defects":[{"id":"def-1","type":"Oil Stain","severity":"CRITICAL"|"MEDIUM"|"LOW","location_description":"Top-right quadrant, near selvedge edge","confidence":0.94,"recommendation":"Cut out section or re-wash batch"}]}. Score must be an integer from 0 to 100. Confidence must be from 0 to 1. List at most 5 defects, most severe first. Keep every string under 15 words. Use an empty defects array when none are visible. PASS means no meaningful visible defect, WARNING means minor/reviewable issue, FAIL means a significant defect.`;
 
+const resultSchema = {
+  type: "OBJECT",
+  properties: {
+    fabric_quality: { type: "STRING", enum: ["PASS", "WARNING", "FAIL"] },
+    overall_score: { type: "INTEGER" },
+    summary: { type: "STRING" },
+    defects: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          id: { type: "STRING" },
+          type: { type: "STRING" },
+          severity: { type: "STRING", enum: ["CRITICAL", "MEDIUM", "LOW"] },
+          location_description: { type: "STRING" },
+          confidence: { type: "NUMBER" },
+          recommendation: { type: "STRING" },
+        },
+        required: ["id", "type", "severity", "location_description", "confidence", "recommendation"],
+      },
+    },
+  },
+  required: ["fabric_quality", "overall_score", "summary", "defects"],
+} as const;
+
 function validateResult(value: unknown) {
   if (!value || typeof value !== "object") throw new Error("Model returned an invalid result.");
   const result = value as Record<string, unknown>;
-  if (!["PASS", "WARNING", "FAIL"].includes(String(result.fabric_quality))) throw new Error("Model response has an invalid fabric_quality.");
+  const quality = typeof result.fabric_quality === "string" ? result.fabric_quality.trim().toUpperCase() : "";
+  if (!["PASS", "WARNING", "FAIL"].includes(quality)) {
+    throw new Error(`Model response has an invalid fabric_quality: ${JSON.stringify(result.fabric_quality)}`);
+  }
+  result.fabric_quality = quality;
   if (typeof result.overall_score !== "number" || result.overall_score < 0 || result.overall_score > 100) throw new Error("Model response has an invalid overall_score.");
   if (typeof result.summary !== "string" || !Array.isArray(result.defects)) throw new Error("Model response is missing summary or defects.");
   for (const item of result.defects) {
     if (!item || typeof item !== "object") throw new Error("Model response contains an invalid defect.");
     const defect = item as Record<string, unknown>;
-    if (typeof defect.id !== "string" || typeof defect.type !== "string" || !["CRITICAL", "MEDIUM", "LOW"].includes(String(defect.severity)) || typeof defect.location_description !== "string" || typeof defect.recommendation !== "string" || typeof defect.confidence !== "number" || defect.confidence < 0 || defect.confidence > 1) throw new Error("Model response contains an incomplete defect.");
+    const severity = typeof defect.severity === "string" ? defect.severity.trim().toUpperCase() : "";
+    if (typeof defect.id !== "string" || typeof defect.type !== "string" || !["CRITICAL", "MEDIUM", "LOW"].includes(severity) || typeof defect.location_description !== "string" || typeof defect.recommendation !== "string" || typeof defect.confidence !== "number" || defect.confidence < 0 || defect.confidence > 1) throw new Error("Model response contains an incomplete defect.");
+    defect.severity = severity;
   }
   return result;
 }
@@ -47,43 +79,26 @@ function upstreamErrorMessage(kind: "timeout" | "transient") {
     : "The AI service is temporarily busy. Please retry in a moment.";
 }
 
-async function runModel(ai: GoogleGenAI, mimeType: string, data: string, timeoutMs: number, transport: "inline" | "file", displayName: string) {
-  let uploaded: Awaited<ReturnType<typeof ai.files.upload>> | undefined;
-  try {
-    let imagePart: { inlineData: { mimeType: string; data: string } } | { fileData: { fileUri: string; mimeType: string } };
-    if (transport === "file") {
-      uploaded = await ai.files.upload({
-        file: new Blob([Buffer.from(data, "base64")], { type: mimeType }),
-        config: { mimeType, displayName: displayName.slice(0, 100) || "fabric-sample", abortSignal: AbortSignal.timeout(Math.min(timeoutMs, 6_000)) },
-      });
-      if (!uploaded.uri) throw new Error("Google uploaded the image but did not return a file URI.");
-      imagePart = { fileData: { fileUri: uploaded.uri, mimeType } };
-    } else {
-      imagePart = { inlineData: { mimeType, data } };
-    }
-    const response = await ai.models.generateContent({
-      model: PRIMARY_MODEL,
-      contents: [imagePart, prompt],
-      config: {
-        responseMimeType: "application/json",
-        temperature: 0,
-        maxOutputTokens: 800,
-        abortSignal: AbortSignal.timeout(timeoutMs),
-        // Defect detection does not need extended reasoning; keep Gemma's thinking minimal.
-        thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-      },
-    });
-    if (!response.text) throw new Error("The model returned an empty response.");
-    return validateResult(JSON.parse(response.text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim()));
-  } finally {
-    if (uploaded?.name) {
-      try {
-        await ai.files.delete({ name: uploaded.name, config: { httpOptions: { timeout: 2_000, retryOptions: { attempts: 1 } } } });
-      } catch (error) {
-        console.warn("Could not remove temporary Gemma upload:", error instanceof Error ? error.message : error);
-      }
-    }
-  }
+async function runModel(ai: GoogleGenAI, model: string, mimeType: string, data: string, timeoutMs: number) {
+  const isGemini = model.startsWith("gemini");
+  const response = await ai.models.generateContent({
+    model,
+    contents: [{ inlineData: { mimeType, data } }, prompt],
+    config: {
+      responseMimeType: "application/json",
+      temperature: 0,
+      maxOutputTokens: 800,
+      abortSignal: AbortSignal.timeout(timeoutMs),
+      // Gemma 4 and Gemini 2.5 "think" by default; thinking tokens are generated at ~40 tok/s, which is
+      // where tens of seconds go. Defect detection doesn't need it.
+      ...(model.startsWith("gemma-4") ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } } : {}),
+      ...(/^gemini-2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+      // Schema-constrained output is faster and removes malformed-JSON retries. Only on Gemini models.
+      ...(isGemini ? { responseSchema: resultSchema } : {}),
+    },
+  });
+  if (!response.text) throw new Error("The model returned an empty response.");
+  return validateResult(JSON.parse(response.text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim()));
 }
 
 export async function POST(request: Request) {
@@ -101,21 +116,19 @@ export async function POST(request: Request) {
     // We do our own bounded fallback below instead.
     const ai = new GoogleGenAI({ apiKey, httpOptions: { retryOptions: { attempts: 1 } } });
 
-    const plan: Array<{ timeoutMs: number; transport: "inline" | "file" }> = [
-      { timeoutMs: PRIMARY_TIMEOUT_MS, transport: "inline" },
-      { timeoutMs: FALLBACK_TIMEOUT_MS, transport: "file" },
-    ];
+    const plan: Array<{ model: string; timeoutMs: number }> = [{ model: PRIMARY_MODEL, timeoutMs: PRIMARY_TIMEOUT_MS }];
+    plan.push({ model: FALLBACK_MODEL, timeoutMs: FALLBACK_TIMEOUT_MS });
 
     let lastKind: "timeout" | "transient" = "transient";
     for (const step of plan) {
       const startedAt = Date.now();
       try {
-        const result = await runModel(ai, file.type, base64Data, step.timeoutMs, step.transport, file.name);
-        console.log(`inspect ok model=${PRIMARY_MODEL} transport=${step.transport} ms=${Date.now() - startedAt}`);
-        return NextResponse.json({ ...result, model_used: PRIMARY_MODEL });
+        const result = await runModel(ai, step.model, file.type, base64Data, step.timeoutMs);
+        console.log(`inspect ok model=${step.model} ms=${Date.now() - startedAt}`);
+        return NextResponse.json({ ...result, model_used: step.model });
       } catch (error) {
         const kind = classifyUpstream(error);
-        console.error(`inspect fail model=${PRIMARY_MODEL} transport=${step.transport} ms=${Date.now() - startedAt} kind=${kind}:`, error instanceof Error ? error.message : error);
+        console.error(`inspect fail model=${step.model} ms=${Date.now() - startedAt} kind=${kind}:`, error instanceof Error ? error.message : error);
         if (kind === "other" && !(error instanceof SyntaxError)) throw error;
         lastKind = kind === "timeout" ? "timeout" : "transient";
       }
